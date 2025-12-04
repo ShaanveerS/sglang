@@ -381,6 +381,17 @@ class ForwardBatch:
         )
         device = model_runner.device
 
+        # Model-specific CSM routing
+        csm_phase = getattr(batch, "csm_phase", None)
+        if csm_phase is not None:
+            ret.model_specific_states = {
+                "csm_phase": torch.tensor(
+                    csm_phase, dtype=torch.int64, device=device
+                )
+            }
+        else:
+            ret.model_specific_states = {}
+
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)

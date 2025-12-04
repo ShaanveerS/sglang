@@ -292,6 +292,16 @@ class MultimodalDataItem:
 
 
 @dataclasses.dataclass
+class CsmState:
+    """Per-request CSM scheduling state (lives in Scheduler, CPU side)."""
+
+    in_audio: bool = False          # are we inside an audio span
+    codebook_idx: int = 0           # 0..num_codebooks-1
+    phase: int = 0                  # 0 = backbone, 1 = depth (for NEXT step)
+    num_codebooks: int = 32         # default; can be overwritten from config
+
+
+@dataclasses.dataclass
 class MultimodalInputs:
     """The multimodal data related inputs."""
 
@@ -680,6 +690,8 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+        # CSM state (scheduler-managed)
+        self.csm_state: Optional[CsmState] = None
 
     @property
     def seqlen(self):
@@ -1817,7 +1829,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
         )
 
-        return ModelWorkerBatch(
+        mwb = ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
@@ -1866,6 +1878,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
         )
+        # Carry CSM phase for decode steps
+        if self.forward_mode.is_decode():
+            phases: list[int] = []
+            for req in self.reqs:
+                st = getattr(req, "csm_state", None)
+                phases.append(0 if st is None else int(st.phase))
+            mwb.csm_phase = phases
+        return mwb
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
@@ -1978,3 +1998,5 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Model-specific: CSM phase per req in batch (decode only)
+    csm_phase: Optional[List[int]] = None

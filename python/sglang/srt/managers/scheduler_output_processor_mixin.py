@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+import os
 
 import torch
 
@@ -20,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.models.csm_llama_wrapper import CsmLlamaWrapper
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -379,6 +381,9 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
+        # Update per-request CSM scheduling state (if applicable)
+        self._update_csm_state_for_decode(batch, next_token_ids)
+
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -388,6 +393,65 @@ class SchedulerOutputProcessorMixin:
             and self.forward_ct_decode % self.server_args.decode_log_interval == 0
         ):
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
+
+    def _update_csm_state_for_decode(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        next_token_ids: Union[List[int], torch.Tensor],
+    ) -> None:
+        """Update per-request CSM state after a decode step and prepare phase for next step."""
+        model = getattr(self.tp_worker.model_runner, "model", None)
+        if not isinstance(model, CsmLlamaWrapper):
+            return
+
+        cfg = getattr(model, "config", None)
+        audio_token_id = getattr(cfg, "audio_token_id", 128002)
+        audio_eos_token_id = getattr(cfg, "audio_eos_token_id", 128003)
+        codebook_pad_token_id = getattr(cfg, "codebook_pad_token_id", 2050)
+        codebook_eos_token_id = getattr(cfg, "codebook_eos_token_id", 0)
+        num_codebooks = getattr(cfg, "num_codebooks", 32)
+
+        toks = next_token_ids.tolist() if isinstance(next_token_ids, torch.Tensor) else next_token_ids
+        toggle_test = os.environ.get("CSM_TOGGLE_PHASE_TEST", "0") == "1"
+
+        for i, req in enumerate(batch.reqs):
+            tok = toks[i] if i < len(toks) else None
+            st = getattr(req, "csm_state", None)
+            if st is None:
+                from sglang.srt.managers.schedule_batch import CsmState
+
+                st = CsmState(num_codebooks=num_codebooks)
+                req.csm_state = st
+
+            if toggle_test:
+                st.phase = 1 - int(st.phase)
+                continue
+
+            if tok == audio_token_id:
+                st.in_audio = True
+                st.codebook_idx = 0
+                st.phase = 0  # next backbone
+                continue
+
+            if not st.in_audio:
+                st.phase = 0
+                continue
+
+            if tok in (audio_eos_token_id, codebook_pad_token_id, codebook_eos_token_id):
+                st.in_audio = False
+                st.codebook_idx = 0
+                st.phase = 0
+                continue
+
+            if st.codebook_idx == 0:
+                st.codebook_idx = 1
+                st.phase = 1
+            elif st.codebook_idx + 1 < st.num_codebooks:
+                st.codebook_idx += 1
+                st.phase = 1
+            else:
+                st.codebook_idx = 0
+                st.phase = 0
 
     def _process_input_token_logprobs(
         self, req: Req, input_token_logprobs: List
