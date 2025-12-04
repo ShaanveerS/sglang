@@ -137,7 +137,7 @@ class CsmLlamaWrapper(LlamaForCausalLM):
         # 1) BACKBONE: use normal SGLang Llama stack + KV cache
         # ======================================================
         if num_backbone > 0:
-            bb_idx = backbone_mask.nonzero(as_tuple=False).squeeze(-1)  # [num_backbone]
+            bb_idx = backbone_mask.nonzero(as_tuple=False).view(-1)  # [num_backbone]
 
             if hidden_states.dim() == 3:
                 last_h = hidden_states[:, -1, :]        # [B, H]
@@ -161,7 +161,7 @@ class CsmLlamaWrapper(LlamaForCausalLM):
         # ======================================================
         if num_depth > 0:
             logger.info("CSM depth step: rows=%d", num_depth)
-            dd_idx = depth_mask.nonzero(as_tuple=False).squeeze(-1)  # [num_depth]
+            dd_idx = depth_mask.nonzero(as_tuple=False).view(-1)  # [num_depth]
 
             # Lazy load the depth decoder if needed; on failure, fallback to backbone logits.
             try:

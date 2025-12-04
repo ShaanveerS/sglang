@@ -419,9 +419,17 @@ class SchedulerOutputProcessorMixin:
             st = getattr(req, "csm_state", None)
             if st is None:
                 from sglang.srt.managers.schedule_batch import CsmState
-
                 st = CsmState(num_codebooks=num_codebooks)
                 req.csm_state = st
+                # Seed from prompt tail so phases reflect last prompt token.
+                # If the prompt ended with the audio start token, we enter audio and
+                # start with backbone for codebook-0 on the next step.
+                if req.origin_input_ids:
+                    last_prompt_tok = req.origin_input_ids[-1]
+                    if last_prompt_tok == audio_token_id:
+                        st.in_audio = True
+                        st.codebook_idx = 0
+                        st.phase = 0
 
             if toggle_test:
                 st.phase = 1 - int(st.phase)
