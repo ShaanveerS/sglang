@@ -412,6 +412,7 @@ class SchedulerOutputProcessorMixin:
 
         toks = next_token_ids.tolist() if isinstance(next_token_ids, torch.Tensor) else next_token_ids
         toggle_test = os.environ.get("CSM_TOGGLE_PHASE_TEST", "0") == "1"
+        debug_phase = os.environ.get("CSM_DEBUG_PHASE", "0") == "1"
 
         for i, req in enumerate(batch.reqs):
             tok = toks[i] if i < len(toks) else None
@@ -479,6 +480,16 @@ class SchedulerOutputProcessorMixin:
                     # Completed this frame; next step backbone for next frame
                     st.codebook_idx = 0
                     st.phase = 0
+
+            if debug_phase:
+                logger.info(
+                    "CSM DEBUG rid=%s tok=%s in_audio=%s codebook_idx=%d next_phase=%d",
+                    getattr(req, "rid", None),
+                    tok,
+                    st.in_audio,
+                    st.codebook_idx,
+                    st.phase,
+                )
 
     def _process_input_token_logprobs(
         self, req: Req, input_token_logprobs: List
