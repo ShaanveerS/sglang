@@ -408,7 +408,6 @@ class SchedulerOutputProcessorMixin:
         audio_token_id = getattr(cfg, "audio_token_id", 128002)
         audio_eos_token_id = getattr(cfg, "audio_eos_token_id", 128003)
         codebook_pad_token_id = getattr(cfg, "codebook_pad_token_id", 2050)
-        codebook_eos_token_id = getattr(cfg, "codebook_eos_token_id", 0)
         num_codebooks = getattr(cfg, "num_codebooks", 32)
 
         toks = next_token_ids.tolist() if isinstance(next_token_ids, torch.Tensor) else next_token_ids
@@ -419,55 +418,67 @@ class SchedulerOutputProcessorMixin:
             st = getattr(req, "csm_state", None)
             if st is None:
                 from sglang.srt.managers.schedule_batch import CsmState
+
                 st = CsmState(num_codebooks=num_codebooks)
                 req.csm_state = st
-                # Seed from prompt tail so phases reflect last prompt token.
-                # If the prompt ended with the audio start token, we enter audio and
-                # start with backbone for codebook-0 on the next step.
-                if req.origin_input_ids:
-                    last_prompt_tok = req.origin_input_ids[-1]
-                    if last_prompt_tok == audio_token_id:
-                        st.in_audio = True
-                        st.codebook_idx = 0
-                        st.phase = 0
+                # Seed from prompt tail: if prompt ends in <|AUDIO|>, start in audio mode.
+                origin = getattr(req, "origin_input_ids", None)
+                if origin and origin[-1] == audio_token_id:
+                    st.in_audio = True
+                    st.codebook_idx = 0
+                    st.phase = 0  # next step = backbone for codebook-0
 
             if toggle_test:
                 st.phase = 1 - int(st.phase)
                 continue
 
+            # No token (shouldn't happen) → stay backbone.
+            if tok is None:
+                st.phase = 0
+                st.codebook_idx = 0
+                continue
+
+            # (1) Model emits <|AUDIO|> → start / restart audio span
             if tok == audio_token_id:
                 st.in_audio = True
                 st.codebook_idx = 0
-                st.phase = 0  # next backbone
+                st.phase = 0
                 continue
 
+            # (2) If not in audio, stay on backbone
             if not st.in_audio:
                 st.phase = 0
+                st.codebook_idx = 0
                 continue
 
-            if tok in (audio_eos_token_id, codebook_pad_token_id, codebook_eos_token_id):
+            # (3) Explicit end-of-audio
+            if tok == audio_eos_token_id:
                 st.in_audio = False
                 st.codebook_idx = 0
                 st.phase = 0
                 continue
 
-            # Safety: only enter/continue depth if the token is in the codebook vocab.
-            # Otherwise we likely sampled a text token, so bail out of audio mode.
-            if tok is None or tok < 0 or tok > codebook_pad_token_id:
+            # (4) If token is outside codebook range, treat as text and leave audio
+            if tok < 0 or tok > codebook_pad_token_id:
                 st.in_audio = False
                 st.codebook_idx = 0
                 st.phase = 0
                 continue
 
-            if st.codebook_idx == 0:
+            # (5) In audio and just produced a codebook token; decide next phase
+            if st.phase == 0:
+                # Backbone just produced codebook-0; next -> depth for codebook-1
                 st.codebook_idx = 1
                 st.phase = 1
-            elif st.codebook_idx + 1 < st.num_codebooks:
-                st.codebook_idx += 1
-                st.phase = 1
             else:
-                st.codebook_idx = 0
-                st.phase = 0
+                # Depth produced codebook k>=1
+                if st.codebook_idx + 1 < st.num_codebooks:
+                    st.codebook_idx += 1
+                    st.phase = 1
+                else:
+                    # Completed this frame; next step backbone for next frame
+                    st.codebook_idx = 0
+                    st.phase = 0
 
     def _process_input_token_logprobs(
         self, req: Req, input_token_logprobs: List

@@ -162,8 +162,9 @@ class CsmLlamaWrapper(LlamaForCausalLM):
         if num_depth > 0:
             logger.info("CSM depth step: rows=%d", num_depth)
             dd_idx = depth_mask.nonzero(as_tuple=False).view(-1)  # [num_depth]
+            strict = os.environ.get("CSM_NO_DEPTH_FALLBACK") == "1"
 
-            # Lazy load the depth decoder if needed; on failure, fallback to backbone logits.
+            # Lazy load the depth decoder if needed; on failure, fallback or raise.
             try:
                 if self.depth_decoder is None:
                     if not self._depth_path:
@@ -191,10 +192,9 @@ class CsmLlamaWrapper(LlamaForCausalLM):
                     ).to(self.device)
                     logger.info("CSM depth decoder loaded from %s", self._depth_path)
             except Exception as e:
-                if os.environ.get("CSM_NO_DEPTH_FALLBACK") == "1":
-                    logger.error("CSM depth load/step failed and strict mode enabled; raising: %s", e)
+                if strict:
+                    logger.exception("CSM depth load failed in strict mode")
                     raise
-                # Fallback: use backbone logits for depth rows
                 logger.warning("CSM depth failed, falling back to backbone for rows=%d: %s", num_depth, e)
                 next_token_logits[dd_idx] = logits_full[dd_idx]
                 return LogitsProcessorOutput(
@@ -232,7 +232,6 @@ class CsmLlamaWrapper(LlamaForCausalLM):
                 past_for_depth_batch.append(self._csm_depth_past_table.get(req_id, None))
 
             backbone_last_h = torch.stack(backbone_last_h_list, dim=0)  # [num_depth, H]
-            backbone_last_h = backbone_last_h.unsqueeze(1)              # [num_depth, 1, H]
 
             # Some CSM decoders expect per-sample Cache objects, not a batched list.
             # Call per-row to be compatible.
@@ -243,27 +242,41 @@ class CsmLlamaWrapper(LlamaForCausalLM):
                 try:
                     out = self.depth_decoder(
                         input_ids=dd_input_ids_2d[local_row : local_row + 1],
-                        backbone_last_hidden_state=backbone_last_h[local_row : local_row + 1],
+                        backbone_last_hidden_state=backbone_last_h[local_row : local_row + 1],  # [1, H]
                         past_key_values=past_for_depth_batch[local_row],
                         use_cache=True,
+                        logits_to_keep=1,  # keep last token logits (avoid empty slice)
                     )
                     depth_logits_rows.append(out.logits[:, -1, :])  # [1, vocab]
                     new_past_list.append(out.past_key_values)
                 except Exception as e:
+                    if strict:
+                        logger.exception("CSM depth forward failed in strict mode")
+                        raise
                     logger.warning("CSM depth forward failed, fallback to backbone for one row: %s", e)
-                    # Fallback to backbone logits for this row
                     row_slice = dd_idx[local_row : local_row + 1]
                     depth_logits_rows.append(logits_full[row_slice])
                     new_past_list.append(None)
-            depth_logits = torch.cat(depth_logits_rows, dim=0)  # [num_depth, vocab]
+            depth_logits = torch.cat(depth_logits_rows, dim=0)  # [num_depth, depth_vocab]
             new_past = new_past_list
+
+            # Align depth vocab (codebook size) into backbone vocab space.
+            depth_vocab = depth_logits.shape[1]
+            padded = torch.full(
+                (len(dd_idx), self.vocab_size),
+                float("-inf"),
+                device=depth_logits.device,
+                dtype=depth_logits.dtype,
+            )
+            padded[:, :depth_vocab] = depth_logits
+            padded = padded.to(next_token_logits.dtype)
 
             # Write back updated per-req cache and logits
             for local_row, batch_row in enumerate(dd_idx.tolist()):
                 req_id = int(req_indices[batch_row])
                 self._csm_depth_past_table[req_id] = new_past[local_row]
 
-            next_token_logits[dd_idx] = depth_logits
+            next_token_logits[dd_idx] = padded
 
         return LogitsProcessorOutput(
             next_token_logits=next_token_logits,
