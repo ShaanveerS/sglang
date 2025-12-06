@@ -117,6 +117,7 @@ from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    CsmState,
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
@@ -1239,6 +1240,41 @@ class Scheduler(
 
         return image_inputs
 
+    def _init_csm_state_from_prompt(self, req: Req) -> None:
+        """Initialize CSM scheduling state from prompt markers (best-effort)."""
+        if req.csm_state is not None:
+            return
+
+        model_cfg = getattr(self, "model_config", None)
+        hf_cfg = getattr(model_cfg, "hf_config", None) if model_cfg else None
+        if hf_cfg is None:
+            return
+
+        archs = getattr(hf_cfg, "architectures", []) or []
+        if not any(str(a).lower().startswith("csm") or str(a) == "CsmLlamaWrapper" for a in archs):
+            return
+
+        audio_token_id = getattr(hf_cfg, "audio_token_id", None)
+        if audio_token_id is None:
+            return
+
+        toks = getattr(req, "origin_input_ids", None)
+        if not toks:
+            return
+
+        try:
+            _ = len(toks) - 1 - list(reversed(toks)).index(audio_token_id)
+        except ValueError:
+            return
+
+        num_codebooks = getattr(hf_cfg, "num_codebooks", 32)
+        req.csm_state = CsmState(
+            in_audio=True,
+            codebook_idx=0,
+            phase=0,  # first decode step after prompt uses backbone
+            num_codebooks=num_codebooks,
+        )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1339,6 +1375,9 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        # Initialize CSM state based on prompt markers (if applicable)
+        self._init_csm_state_from_prompt(req)
 
         # initialize before returning
         self.init_req_max_new_tokens(req)

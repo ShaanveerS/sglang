@@ -451,6 +451,14 @@ class SchedulerOutputProcessorMixin:
                 st.phase = 0
                 continue
 
+            # Safety: only enter/continue depth if the token is in the codebook vocab.
+            # Otherwise we likely sampled a text token, so bail out of audio mode.
+            if tok is None or tok < 0 or tok > codebook_pad_token_id:
+                st.in_audio = False
+                st.codebook_idx = 0
+                st.phase = 0
+                continue
+
             if st.codebook_idx == 0:
                 st.codebook_idx = 1
                 st.phase = 1
