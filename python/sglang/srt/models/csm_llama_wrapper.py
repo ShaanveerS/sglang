@@ -276,7 +276,11 @@ class CsmLlamaWrapper(LlamaForCausalLM):
                 req_id = int(req_indices[batch_row])
                 self._csm_depth_past_table[req_id] = new_past[local_row]
 
-            next_token_logits[dd_idx] = padded
+            # DEBUG/diagnostic: optionally force depth logits for all rows if shapes match
+            if padded.shape[0] == next_token_logits.shape[0]:
+                next_token_logits[:] = padded
+            else:
+                next_token_logits[dd_idx] = padded
 
         return LogitsProcessorOutput(
             next_token_logits=next_token_logits,
