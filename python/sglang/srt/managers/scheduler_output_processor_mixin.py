@@ -395,106 +395,106 @@ class SchedulerOutputProcessorMixin:
             self.log_decode_stats(can_run_cuda_graph, running_batch=batch)
 
     def _update_csm_state_for_decode(
-        self: Scheduler,
+        self,
         batch: ScheduleBatch,
         next_token_ids: Union[List[int], torch.Tensor],
     ) -> None:
-        """Update per-request CSM state after a decode step and prepare phase for next step."""
-        model = getattr(self.tp_worker.model_runner, "model", None)
-        if not isinstance(model, CsmLlamaWrapper):
-            return
+        """Update per-request CSM state. Fixed for Process Boundary & Range Check."""
 
-        cfg = getattr(model, "config", None)
-        audio_token_id = getattr(cfg, "audio_token_id", 128002)
-        audio_eos_token_id = getattr(cfg, "audio_eos_token_id", 128003)
-        codebook_pad_token_id = getattr(cfg, "codebook_pad_token_id", 2050)
-        num_codebooks = getattr(cfg, "num_codebooks", 32)
+        # --- 1. Distributed Fix: Check Config, NOT Model Instance ---
+        model_cfg = getattr(self, "model_config", None)
+        hf_cfg = getattr(model_cfg, "hf_config", None)
+
+        # Guard: Check if we are running the CSM architecture
+        is_csm = False
+        if hf_cfg:
+            archs = getattr(hf_cfg, "architectures", []) or []
+            # Check for the class name registered in your wrapper
+            if any("Csm" in str(a) or "Wrapper" in str(a) for a in archs):
+                is_csm = True
+
+        if not is_csm:
+            return
+        # ------------------------------------------------------------
+
+        # Load constants from config
+        audio_token_id = getattr(hf_cfg, "audio_token_id", 128002)
+        audio_eos_token_id = getattr(hf_cfg, "audio_eos_token_id", 128003)
+        codebook_pad_token_id = getattr(hf_cfg, "codebook_pad_token_id", 2050)
+        num_codebooks = getattr(hf_cfg, "num_codebooks", 32)
 
         toks = next_token_ids.tolist() if isinstance(next_token_ids, torch.Tensor) else next_token_ids
-        toggle_test = os.environ.get("CSM_TOGGLE_PHASE_TEST", "0") == "1"
+
+        debug = os.environ.get("CSM_DEBUG_PHASE", "0") == "1"
 
         for i, req in enumerate(batch.reqs):
             tok = toks[i] if i < len(toks) else None
             st = getattr(req, "csm_state", None)
+
+            # Init state if missing (e.g., recovery or missed prefill init)
             if st is None:
                 from sglang.srt.managers.schedule_batch import CsmState
 
                 st = CsmState(num_codebooks=num_codebooks)
                 req.csm_state = st
-                # Seed from prompt tail: if prompt ends in <|AUDIO|>, start in audio mode.
+
+                # Seed from prompt tail: Did prompt end with <|AUDIO|>?
                 origin = getattr(req, "origin_input_ids", None)
                 if origin and origin[-1] == audio_token_id:
                     st.in_audio = True
                     st.codebook_idx = 0
-                    st.phase = 0  # next step = backbone for codebook-0
+                    st.phase = 0
 
-            if toggle_test:
-                st.phase = 1 - int(st.phase)
-                continue
-
-            # No token (shouldn't happen) → stay backbone.
-            if tok is None:
-                st.phase = 0
-                st.codebook_idx = 0
-                continue
-
-            # (1) Model emits <|AUDIO|> → start / restart audio span
+            # (1) Model emits <|AUDIO|> -> start
             if tok == audio_token_id:
                 st.in_audio = True
                 st.codebook_idx = 0
                 st.phase = 0
-                # Starting/restarting audio span: clear depth cache for this req.
-                model = getattr(self.tp_worker.model_runner, "model", None)
-                if isinstance(model, CsmLlamaWrapper) and req.req_pool_idx is not None:
-                    model._csm_depth_past_table.pop(int(req.req_pool_idx), None)
                 continue
 
-            # (2) If not in audio, stay on backbone
+            # (2) Not in audio -> stay backbone
             if not st.in_audio:
                 st.phase = 0
                 st.codebook_idx = 0
                 continue
 
-            # (3) Explicit end-of-audio
+            # (3) Explicit end
             if tok == audio_eos_token_id:
                 st.in_audio = False
                 st.codebook_idx = 0
                 st.phase = 0
                 continue
 
-            # (4) If token is outside codebook range, treat as text and leave audio
-            if tok < 0 or tok > codebook_pad_token_id:
+            # --- 2. Logic Fix: Range Check ---
+            # Only check range if we are in DEPTH phase (>0).
+            # Phase 0 (Backbone) produces large tokens (100k+), which is allowed.
+            if st.phase > 0 and (tok < 0 or tok > codebook_pad_token_id):
+                if debug:
+                    logger.warning(f"CSM Abort: Expected depth tok, got {tok}")
                 st.in_audio = False
                 st.codebook_idx = 0
                 st.phase = 0
                 continue
 
-            # (5) In audio and just produced a codebook token; decide next phase
+            # (5) Transition
             if st.phase == 0:
-                # Backbone just produced codebook-0; next -> depth for codebook-1
+                # Backbone just produced CB0. Next -> Depth (CB1)
                 st.codebook_idx = 1
                 st.phase = 1
             else:
-                # Depth produced codebook k>=1
+                # Depth produced CB_k
                 if st.codebook_idx + 1 < st.num_codebooks:
                     st.codebook_idx += 1
                     st.phase = 1
                 else:
-                    # Completed this frame; next step backbone for next frame
+                    # Frame done. Next -> Backbone (CB0)
                     st.codebook_idx = 0
                     st.phase = 0
-                    model = getattr(self.tp_worker.model_runner, "model", None)
-                    if isinstance(model, CsmLlamaWrapper) and req.req_pool_idx is not None:
-                        model._csm_depth_past_table.pop(int(req.req_pool_idx), None)
 
-            if os.environ.get("CSM_DEBUG_PHASE", "0") == "1":
+            if debug:
                 logger.info(
-                    "CSM DEBUG rid=%s tok=%s in_audio=%s codebook_idx=%d next_phase=%d",
-                    getattr(req, "rid", None),
-                    tok,
-                    st.in_audio,
-                    st.codebook_idx,
-                    st.phase,
+                    "CSM rid=%s tok=%s ph=%d cb=%d",
+                    getattr(req, "rid", "")[:4], tok, st.phase, st.codebook_idx
                 )
 
     def _process_input_token_logprobs(
