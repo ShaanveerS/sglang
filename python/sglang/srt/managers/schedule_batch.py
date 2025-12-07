@@ -1881,10 +1881,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Carry CSM phase for decode steps
         if self.forward_mode.is_decode():
             phases: list[int] = []
+            in_audios: list[bool] = []
             for req in self.reqs:
                 st = getattr(req, "csm_state", None)
                 phases.append(0 if st is None else int(st.phase))
+                in_audios.append(False if st is None else bool(st.in_audio))
             mwb.csm_phase = phases
+            mwb.csm_in_audio = in_audios
         return mwb
 
     def copy(self):
@@ -2000,3 +2003,5 @@ class ModelWorkerBatch:
     is_prefill_only: bool = False
     # Model-specific: CSM phase per req in batch (decode only)
     csm_phase: Optional[List[int]] = None
+    # Model-specific: CSM in-audio flag per req in batch (decode only)
+    csm_in_audio: Optional[List[bool]] = None

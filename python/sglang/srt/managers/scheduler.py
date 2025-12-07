@@ -1260,6 +1260,9 @@ class Scheduler(
 
         toks = getattr(req, "origin_input_ids", None)
         if not toks:
+            # Fall back to raw input_ids when origin_input_ids is missing (e.g., /generate with input_ids)
+            toks = getattr(req, "input_ids", None)
+        if not toks:
             return
 
         try:

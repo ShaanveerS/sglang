@@ -89,14 +89,22 @@ class CsmLlamaWrapper(LlamaForCausalLM):
             phase = phase_in.to(device)  # 0=backbone, 1=depth
         assert phase.shape[0] == B, "csm_phase must match batch size"
 
+        in_audio_in = ms.get("csm_in_audio", None)
+        if in_audio_in is None:
+            in_audio = torch.zeros(B, dtype=torch.bool, device=device)
+        else:
+            in_audio = in_audio_in.to(device=device, dtype=torch.bool)
+        assert in_audio.shape[0] == B, "csm_in_audio must match batch size"
+
         backbone_mask = (phase == 0)
         depth_mask = (phase == 1)
 
         num_backbone = int(backbone_mask.sum())
         num_depth = int(depth_mask.sum())
 
-        # If all rows are backbone (common in boot smoke test), delegate to base class
-        if num_depth == 0:
+        # If all rows are backbone and no row is in audio, delegate to base class
+        in_audio_backbone = backbone_mask & in_audio
+        if num_depth == 0 and not bool(in_audio_backbone.any()):
             return super().forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -132,6 +140,29 @@ class CsmLlamaWrapper(LlamaForCausalLM):
             forward_batch,
         )
         logits_full = bb_lp_out.next_token_logits  # [B, vocab]
+
+        # Optional masking: when in_audio and phase==0, force logits to codebook range
+        # Also mask if the current token is the audio start marker (prompt ended with <|AUDIO|>)
+        audio_token_id = getattr(self.config, "audio_token_id", 128002)
+        if input_ids.dim() == 1:
+            last_tok = input_ids
+        else:
+            last_tok = input_ids[:, -1]
+        prompt_audio_rows = backbone_mask & (last_tok == audio_token_id)
+        mask_rows = (in_audio_backbone | prompt_audio_rows).nonzero(as_tuple=False).view(-1)
+
+        if mask_rows.numel() > 0:
+            codebook_pad = getattr(self.config, "codebook_pad_token_id", 2050)
+            audio_eos = getattr(self.config, "audio_eos_token_id", 128003)
+            if mask_rows.numel() > 0:
+                # Save original logits, then zero-out and re-enable allowed range
+                orig = logits_full[mask_rows].clone()
+                logits_full[mask_rows] = float("-inf")
+                keep_end = min(codebook_pad + 1, logits_full.shape[-1])
+                logits_full[mask_rows, :keep_end] = orig[:, :keep_end]
+                # Allow audio_eos if in range
+                if 0 <= audio_eos < logits_full.shape[-1]:
+                    logits_full[mask_rows, audio_eos] = orig[:, audio_eos]
 
         # ======================================================
         # 1) BACKBONE: use normal SGLang Llama stack + KV cache

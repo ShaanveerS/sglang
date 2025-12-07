@@ -412,7 +412,6 @@ class SchedulerOutputProcessorMixin:
 
         toks = next_token_ids.tolist() if isinstance(next_token_ids, torch.Tensor) else next_token_ids
         toggle_test = os.environ.get("CSM_TOGGLE_PHASE_TEST", "0") == "1"
-        debug_phase = os.environ.get("CSM_DEBUG_PHASE", "0") == "1"
 
         for i, req in enumerate(batch.reqs):
             tok = toks[i] if i < len(toks) else None
@@ -444,6 +443,10 @@ class SchedulerOutputProcessorMixin:
                 st.in_audio = True
                 st.codebook_idx = 0
                 st.phase = 0
+                # Starting/restarting audio span: clear depth cache for this req.
+                model = getattr(self.tp_worker.model_runner, "model", None)
+                if isinstance(model, CsmLlamaWrapper) and req.req_pool_idx is not None:
+                    model._csm_depth_past_table.pop(int(req.req_pool_idx), None)
                 continue
 
             # (2) If not in audio, stay on backbone
@@ -480,8 +483,11 @@ class SchedulerOutputProcessorMixin:
                     # Completed this frame; next step backbone for next frame
                     st.codebook_idx = 0
                     st.phase = 0
+                    model = getattr(self.tp_worker.model_runner, "model", None)
+                    if isinstance(model, CsmLlamaWrapper) and req.req_pool_idx is not None:
+                        model._csm_depth_past_table.pop(int(req.req_pool_idx), None)
 
-            if debug_phase:
+            if os.environ.get("CSM_DEBUG_PHASE", "0") == "1":
                 logger.info(
                     "CSM DEBUG rid=%s tok=%s in_audio=%s codebook_idx=%d next_phase=%d",
                     getattr(req, "rid", None),

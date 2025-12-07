@@ -383,14 +383,17 @@ class ForwardBatch:
 
         # Model-specific CSM routing
         csm_phase = getattr(batch, "csm_phase", None)
+        csm_in_audio = getattr(batch, "csm_in_audio", None)
+        ms_states: dict[str, torch.Tensor] = {}
         if csm_phase is not None:
-            ret.model_specific_states = {
-                "csm_phase": torch.tensor(
-                    csm_phase, dtype=torch.int64, device=device
-                )
-            }
-        else:
-            ret.model_specific_states = {}
+            ms_states["csm_phase"] = torch.tensor(
+                csm_phase, dtype=torch.int64, device=device
+            )
+        if csm_in_audio is not None:
+            ms_states["csm_in_audio"] = torch.tensor(
+                csm_in_audio, dtype=torch.bool, device=device
+            )
+        ret.model_specific_states = ms_states
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
